@@ -1,3 +1,4 @@
 google-api-python-client
 pandas
 streamlit
+altair==4.2.2
