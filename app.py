@@ -227,7 +227,7 @@ def plot_upload_frequency(df: pd.DataFrame):
         return
     df_monthly = (
         df.set_index("published_at")
-        .resample("M")
+        .resample("ME")
         .size()
         .rename("videos")
         .reset_index()
