@@ -90,6 +90,22 @@ def get_uploads_playlist_id(client, channel_id: str) -> str:
     return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
 
+def extract_video_id(video_url: str) -> str:
+    match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", video_url)
+    if not match:
+        raise ValueError("Unable to extract a video ID from the provided URL.")
+    return match.group(1)
+
+
+def get_channel_id_from_video(client, video_url: str) -> str:
+    video_id = extract_video_id(video_url)
+    response = client.videos().list(part="snippet", id=video_id).execute()
+    items = response.get("items", [])
+    if not items:
+        raise ValueError("No video found for the provided URL.")
+    return items[0]["snippet"]["channelId"]
+
+
 def fetch_playlist_video_ids(client, playlist_id: str, max_videos: int = 50) -> List[str]:
     video_ids: List[str] = []
     next_page = None
@@ -236,18 +252,19 @@ def main():
     with st.sidebar:
         st.header("Inputs")
         api_key = st.text_input("YouTube Data API Key", type="password")
-        channel_id = st.text_input("Channel ID")
+        video_url = st.text_input("Video URL")
         max_videos = st.slider("Number of recent videos", min_value=10, max_value=100, value=50)
         fetch_button = st.button("Fetch Insights")
 
     if fetch_button:
-        if not api_key or not channel_id:
-            st.error("Please provide both an API key and channel ID.")
+        if not api_key or not video_url:
+            st.error("Please provide both an API key and a video URL.")
             return
 
         with st.spinner("Fetching data from YouTube..."):
             try:
                 client = build_client(api_key)
+                channel_id = get_channel_id_from_video(client, video_url)
                 uploads_playlist = get_uploads_playlist_id(client, channel_id)
                 video_ids = fetch_playlist_video_ids(client, uploads_playlist, max_videos)
                 details = fetch_video_details(client, video_ids)
@@ -288,3 +305,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+   
