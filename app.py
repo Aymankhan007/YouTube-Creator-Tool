@@ -41,6 +41,7 @@ def extract_video_id(video_url: str) -> str:
         r"v=([a-zA-Z0-9_-]{11})",
         r"youtu\.be/([a-zA-Z0-9_-]{11})",
         r"shorts/([a-zA-Z0-9_-]{11})",
+        r"embed/([a-zA-Z0-9_-]{11})",
     ]
     for pattern in patterns:
         match = re.search(pattern, video_url)
@@ -59,9 +60,7 @@ def get_channel_id_from_video(client, video_url: str) -> str:
 
 
 def get_uploads_playlist_id(client, channel_id: str) -> str:
-    response = client.channels().list(
-        part="contentDetails", id=channel_id
-    ).execute()
+    response = client.channels().list(part="contentDetails", id=channel_id).execute()
     items = response.get("items", [])
     if not items:
         raise ValueError("Channel not found.")
@@ -93,9 +92,10 @@ def fetch_playlist_video_ids(client, playlist_id: str, max_videos: int) -> List[
 def fetch_video_details(client, video_ids: List[str]) -> List[Dict]:
     details = []
     for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i+50]
+        chunk = video_ids[i:i + 50]
         response = client.videos().list(
-            part="snippet,statistics", id=",".join(chunk)
+            part="snippet,statistics",
+            id=",".join(chunk),
         ).execute()
         details.extend(response.get("items", []))
     return details
@@ -109,9 +109,9 @@ def build_dataframe(details: List[Dict]) -> pd.DataFrame:
         snippet = item.get("snippet", {})
         stats = item.get("statistics", {})
         rows.append({
-            "title": snippet.get("title"),
+            "title": snippet.get("title", ""),
             "published_at": snippet.get("publishedAt"),
-            "tags": ", ".join(snippet.get("tags", [])),
+            "tags": ", ".join(snippet.get("tags", [])) if snippet.get("tags") else "",
             "views": int(stats.get("viewCount", 0)),
             "likes": int(stats.get("likeCount", 0)),
             "comments": int(stats.get("commentCount", 0)),
@@ -120,7 +120,8 @@ def build_dataframe(details: List[Dict]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        df["published_at"] = pd.to_datetime(df["published_at"], utc=True)
+        df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
+        df = df.dropna(subset=["published_at"])
         df.sort_values("published_at", inplace=True)
 
     return df
@@ -130,9 +131,9 @@ def compute_metrics(df: pd.DataFrame) -> Dict[str, float]:
     if df.empty:
         return dict(avg_views=0, avg_likes=0, avg_comments=0, like_comment_ratio=0)
 
-    avg_views = df["views"].mean()
-    avg_likes = df["likes"].mean()
-    avg_comments = df["comments"].mean()
+    avg_views = float(df["views"].mean())
+    avg_likes = float(df["likes"].mean())
+    avg_comments = float(df["comments"].mean())
     ratio = avg_likes / avg_comments if avg_comments else math.nan
 
     return {
@@ -144,7 +145,7 @@ def compute_metrics(df: pd.DataFrame) -> Dict[str, float]:
 
 
 def tokenize(text: str) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]+", text.lower())
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]+", str(text).lower())
     return [t for t in tokens if t not in STOPWORDS and len(t) > 2]
 
 
@@ -153,7 +154,11 @@ def weighted_keyword_scores(df: pd.DataFrame) -> Counter:
     scores = Counter()
 
     for _, row in df.iterrows():
-        months_since = (now - row["published_at"]).days / 30
+        published = row["published_at"]
+        if pd.isna(published):
+            continue
+
+        months_since = (now - published).days / 30
         weight = 1 / (1 + months_since)
 
         tokens = tokenize(row["title"])
@@ -165,7 +170,7 @@ def weighted_keyword_scores(df: pd.DataFrame) -> Counter:
     return scores
 
 
-def build_topic_predictions(df: pd.DataFrame, max_topics: int = 8):
+def build_topic_predictions(df: pd.DataFrame, max_topics: int = 8) -> Tuple[List[str], List[Tuple[str, float]]]:
     if df.empty:
         return [], []
 
@@ -174,8 +179,10 @@ def build_topic_predictions(df: pd.DataFrame, max_topics: int = 8):
     keywords = [kw for kw, _ in top_keywords]
 
     topics = []
-    for template, pair in zip(TOPIC_TEMPLATES,
-                              itertools.cycle(itertools.combinations(keywords, 2))):
+    if len(keywords) < 2:
+        return topics, top_keywords
+
+    for template, pair in zip(TOPIC_TEMPLATES, itertools.cycle(itertools.combinations(keywords, 2))):
         kw1, kw2 = pair
         topic = template.format(kw1=kw1.title(), kw2=kw2.title())
         if topic not in topics:
@@ -195,7 +202,7 @@ def plot_upload_frequency(df: pd.DataFrame):
 
     df_monthly = (
         df.set_index("published_at")
-          .resample("ME")        # Pandas 3 compatible
+          .resample("ME")  # Pandas 3.x month-end
           .size()
           .rename("videos")
           .reset_index()
@@ -208,7 +215,6 @@ def plot_views_over_time(df: pd.DataFrame):
     if df.empty:
         st.info("No videos to plot.")
         return
-
     st.line_chart(df, x="published_at", y="views")
 
 
@@ -225,60 +231,71 @@ def main():
         max_videos = st.slider("Number of recent videos", 10, 100, 50)
         fetch = st.button("Fetch Insights")
 
-    if fetch:
-        if not api_key or not video_url:
-            st.error("Please provide API key and video URL.")
-            return
+    if not fetch:
+        st.info("Enter API key + a YouTube video URL, then click **Fetch Insights**.")
+        return
 
-        with st.spinner("Fetching data from YouTube..."):
-            try:
-                client = build_client(api_key)
-                channel_id = get_channel_id_from_video(client, video_url)
-                playlist_id = get_uploads_playlist_id(client, channel_id)
-                video_ids = fetch_playlist_video_ids(client, playlist_id, max_videos)
+    if not api_key or not video_url:
+        st.error("Please provide both API key and video URL.")
+        return
 
-                if not video_ids:
-                    st.error("No videos found for this channel.")
-                    return
+    with st.spinner("Fetching data from YouTube..."):
+        try:
+            client = build_client(api_key)
+            channel_id = get_channel_id_from_video(client, video_url)
+            playlist_id = get_uploads_playlist_id(client, channel_id)
+            video_ids = fetch_playlist_video_ids(client, playlist_id, max_videos)
 
-                details = fetch_video_details(client, video_ids)
-                df = build_dataframe(details)
-
-            except Exception as e:
-                st.error("Failed to fetch YouTube data.")
-                st.exception(e)
+            if not video_ids:
+                st.error("No videos found for this channel.")
                 return
 
-        # ----- METRICS -----
-        metrics = compute_metrics(df)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Avg Views", f"{metrics['avg_views']:.0f}")
-        c2.metric("Avg Likes", f"{metrics['avg_likes']:.0f}")
-        c3.metric("Avg Comments", f"{metrics['avg_comments']:.0f}")
-        ratio = metrics["like_comment_ratio"]
-        c4.metric("Like/Comment Ratio", f"{ratio:.2f}" if math.isfinite(ratio) else "N/A")
+            details = fetch_video_details(client, video_ids)
+            df = build_dataframe(details)
 
-        st.subheader("📅 Upload Frequency")
-        plot_upload_frequency(df)
+        except Exception as e:
+            st.error("Failed to fetch YouTube data. Check API key, quota, or URL.")
+            st.exception(e)
+            return
 
-        st.subheader("📈 Views Over Time")
-        plot_views_over_time(df)
+    # ----- METRICS -----
+    st.subheader("Channel Summary")
+    metrics = compute_metrics(df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Avg Views", f"{metrics['avg_views']:.0f}")
+    c2.metric("Avg Likes", f"{metrics['avg_likes']:.0f}")
+    c3.metric("Avg Comments", f"{metrics['avg_comments']:.0f}")
+    ratio = metrics["like_comment_ratio"]
+    c4.metric("Like/Comment Ratio", f"{ratio:.2f}" if math.isfinite(ratio) else "N/A")
 
-        st.subheader("💡 Next Video Topic Predictions")
-        topics, keywords = build_topic_predictions(df)
+    st.subheader("📅 Upload Frequency")
+    plot_upload_frequency(df)
 
-        for topic in topics:
-            st.markdown(f"- **{topic}**")
+    st.subheader("📈 Views Over Time")
+    plot_views_over_time(df)
 
-        # FIX for LargeUtf8 crash
-        kw_df = pd.DataFrame(keywords, columns=["Keyword", "Score"])
-        kw_df["Keyword"] = kw_df["Keyword"].astype(str)
-        kw_df["Score"] = pd.to_numeric(kw_df["Score"], errors="coerce").astype(float)
+    st.subheader("💡 Next Video Topic Predictions")
+    topics, keywords = build_topic_predictions(df)
 
-        st.dataframe(kw_df, use_container_width=True)
+    if topics:
+        st.write("Suggested topics:")
+        for t in topics:
+            st.markdown(f"- **{t}**")
+    else:
+        st.info("Not enough keywords to generate topic suggestions.")
 
-        st.subheader("📄 Latest Videos")
-        st.dataframe(df[["title", "published_at", "views", "likes", "comments"]])
+    # IMPORTANT: Use st.table (not st.dataframe) to avoid LargeUtf8 Arrow crash
+    st.write("Top weighted keywords:")
+    kw_df = pd.DataFrame(keywords, columns=["Keyword", "Score"]).copy()
+    kw_df["Keyword"] = kw_df["Keyword"].astype(str)
+    kw_df["Score"] = pd.to_numeric(kw_df["Score"], errors="coerce").fillna(0.0)
+    st.table(kw_df)
+
+    st.subheader("📄 Latest Videos")
+    safe_df = df[["title", "published_at", "views", "likes", "comments"]].copy()
+    safe_df["title"] = safe_df["title"].astype(str)
+    safe_df["published_at"] = safe_df["published_at"].astype(str)
+    st.table(safe_df)
 
 
 if __name__ == "__main__":
