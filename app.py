@@ -9,8 +9,6 @@ import streamlit as st
 from googleapiclient.discovery import build
 
 
-# -------------------- CONSTANTS --------------------
-
 STOPWORDS = {
     "a","about","after","all","also","an","and","are","as","at","be","because","been",
     "but","by","can","could","for","from","get","how","if","in","into","is","it","its",
@@ -30,7 +28,23 @@ TOPIC_TEMPLATES = [
 ]
 
 
-# -------------------- YOUTUBE HELPERS --------------------
+# ---------- UI SAFE RENDERERS (NO ARROW) ----------
+
+def render_as_markdown_table(headers: List[str], rows: List[List[str]]):
+    """Render table as Markdown to avoid Arrow serialization issues."""
+    header_line = "| " + " | ".join(headers) + " |"
+    sep_line = "| " + " | ".join(["---"] * len(headers)) + " |"
+    body_lines = ["| " + " | ".join(str(x) for x in row) + " |" for row in rows]
+    st.markdown("\n".join([header_line, sep_line] + body_lines))
+
+
+def safe_text(x) -> str:
+    if x is None:
+        return ""
+    return str(x)
+
+
+# ---------- YOUTUBE HELPERS ----------
 
 def build_client(api_key: str):
     return build("youtube", "v3", developerKey=api_key)
@@ -43,87 +57,80 @@ def extract_video_id(video_url: str) -> str:
         r"shorts/([a-zA-Z0-9_-]{11})",
         r"embed/([a-zA-Z0-9_-]{11})",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, video_url)
-        if match:
-            return match.group(1)
-    raise ValueError("Invalid YouTube video URL.")
+    for p in patterns:
+        m = re.search(p, video_url)
+        if m:
+            return m.group(1)
+    raise ValueError("Invalid YouTube video URL. Example: https://youtu.be/VIDEOID")
 
 
 def get_channel_id_from_video(client, video_url: str) -> str:
     video_id = extract_video_id(video_url)
-    response = client.videos().list(part="snippet", id=video_id).execute()
-    items = response.get("items", [])
+    resp = client.videos().list(part="snippet", id=video_id).execute()
+    items = resp.get("items", [])
     if not items:
         raise ValueError("No video found for this URL.")
     return items[0]["snippet"]["channelId"]
 
 
 def get_uploads_playlist_id(client, channel_id: str) -> str:
-    response = client.channels().list(part="contentDetails", id=channel_id).execute()
-    items = response.get("items", [])
+    resp = client.channels().list(part="contentDetails", id=channel_id).execute()
+    items = resp.get("items", [])
     if not items:
         raise ValueError("Channel not found.")
     return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
 
 def fetch_playlist_video_ids(client, playlist_id: str, max_videos: int) -> List[str]:
-    video_ids = []
-    next_page = None
-
-    while len(video_ids) < max_videos:
-        response = client.playlistItems().list(
+    ids = []
+    token = None
+    while len(ids) < max_videos:
+        resp = client.playlistItems().list(
             part="contentDetails",
             playlistId=playlist_id,
-            maxResults=min(50, max_videos - len(video_ids)),
-            pageToken=next_page,
+            maxResults=min(50, max_videos - len(ids)),
+            pageToken=token,
         ).execute()
 
-        for item in response.get("items", []):
-            video_ids.append(item["contentDetails"]["videoId"])
+        for item in resp.get("items", []):
+            ids.append(item["contentDetails"]["videoId"])
 
-        next_page = response.get("nextPageToken")
-        if not next_page:
+        token = resp.get("nextPageToken")
+        if not token:
             break
-
-    return video_ids
+    return ids
 
 
 def fetch_video_details(client, video_ids: List[str]) -> List[Dict]:
     details = []
     for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i + 50]
-        response = client.videos().list(
-            part="snippet,statistics",
-            id=",".join(chunk),
-        ).execute()
-        details.extend(response.get("items", []))
+        chunk = video_ids[i:i+50]
+        resp = client.videos().list(part="snippet,statistics", id=",".join(chunk)).execute()
+        details.extend(resp.get("items", []))
     return details
 
 
-# -------------------- DATA PROCESSING --------------------
+# ---------- DATA PROCESSING ----------
 
 def build_dataframe(details: List[Dict]) -> pd.DataFrame:
     rows = []
     for item in details:
-        snippet = item.get("snippet", {})
+        snip = item.get("snippet", {})
         stats = item.get("statistics", {})
         rows.append({
-            "title": snippet.get("title", ""),
-            "published_at": snippet.get("publishedAt"),
-            "tags": ", ".join(snippet.get("tags", [])) if snippet.get("tags") else "",
+            "title": snip.get("title", ""),
+            "published_at": snip.get("publishedAt"),
+            "tags": ", ".join(snip.get("tags", [])) if snip.get("tags") else "",
             "views": int(stats.get("viewCount", 0)),
             "likes": int(stats.get("likeCount", 0)),
             "comments": int(stats.get("commentCount", 0)),
         })
 
     df = pd.DataFrame(rows)
-
     if not df.empty:
         df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
         df = df.dropna(subset=["published_at"])
         df.sort_values("published_at", inplace=True)
-
     return df
 
 
@@ -135,7 +142,6 @@ def compute_metrics(df: pd.DataFrame) -> Dict[str, float]:
     avg_likes = float(df["likes"].mean())
     avg_comments = float(df["comments"].mean())
     ratio = avg_likes / avg_comments if avg_comments else math.nan
-
     return {
         "avg_views": avg_views,
         "avg_likes": avg_likes,
@@ -145,7 +151,7 @@ def compute_metrics(df: pd.DataFrame) -> Dict[str, float]:
 
 
 def tokenize(text: str) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]+", str(text).lower())
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]+", safe_text(text).lower())
     return [t for t in tokens if t not in STOPWORDS and len(t) > 2]
 
 
@@ -161,11 +167,9 @@ def weighted_keyword_scores(df: pd.DataFrame) -> Counter:
         months_since = (now - published).days / 30
         weight = 1 / (1 + months_since)
 
-        tokens = tokenize(row["title"])
-        tokens += tokenize(row["tags"])
-
-        for token in tokens:
-            scores[token] += weight
+        tokens = tokenize(row["title"]) + tokenize(row["tags"])
+        for t in tokens:
+            scores[t] += weight
 
     return scores
 
@@ -178,10 +182,10 @@ def build_topic_predictions(df: pd.DataFrame, max_topics: int = 8) -> Tuple[List
     top_keywords = scores.most_common(8)
     keywords = [kw for kw, _ in top_keywords]
 
-    topics = []
     if len(keywords) < 2:
-        return topics, top_keywords
+        return [], top_keywords
 
+    topics = []
     for template, pair in zip(TOPIC_TEMPLATES, itertools.cycle(itertools.combinations(keywords, 2))):
         kw1, kw2 = pair
         topic = template.format(kw1=kw1.title(), kw2=kw2.title())
@@ -193,7 +197,7 @@ def build_topic_predictions(df: pd.DataFrame, max_topics: int = 8) -> Tuple[List
     return topics, top_keywords
 
 
-# -------------------- PLOTS --------------------
+# ---------- PLOTS ----------
 
 def plot_upload_frequency(df: pd.DataFrame):
     if df.empty:
@@ -202,12 +206,11 @@ def plot_upload_frequency(df: pd.DataFrame):
 
     df_monthly = (
         df.set_index("published_at")
-          .resample("ME")  # Pandas 3.x month-end
+          .resample("ME")      # Pandas 3.x month-end supported
           .size()
           .rename("videos")
           .reset_index()
     )
-
     st.line_chart(df_monthly, x="published_at", y="videos")
 
 
@@ -218,10 +221,10 @@ def plot_views_over_time(df: pd.DataFrame):
     st.line_chart(df, x="published_at", y="views")
 
 
-# -------------------- STREAMLIT APP --------------------
+# ---------- STREAMLIT APP ----------
 
 def main():
-    st.set_page_config("YouTube Insight Generator", layout="wide")
+    st.set_page_config(page_title="YouTube Insight Generator", layout="wide")
     st.title("📊 YouTube Video Analysis & Insight Generator")
 
     with st.sidebar:
@@ -232,7 +235,7 @@ def main():
         fetch = st.button("Fetch Insights")
 
     if not fetch:
-        st.info("Enter API key + a YouTube video URL, then click **Fetch Insights**.")
+        st.info("Enter API key + any YouTube video URL, then click **Fetch Insights**.")
         return
 
     if not api_key or not video_url:
@@ -245,20 +248,17 @@ def main():
             channel_id = get_channel_id_from_video(client, video_url)
             playlist_id = get_uploads_playlist_id(client, channel_id)
             video_ids = fetch_playlist_video_ids(client, playlist_id, max_videos)
-
             if not video_ids:
                 st.error("No videos found for this channel.")
                 return
-
             details = fetch_video_details(client, video_ids)
             df = build_dataframe(details)
-
         except Exception as e:
-            st.error("Failed to fetch YouTube data. Check API key, quota, or URL.")
+            st.error("Failed to fetch YouTube data. Check API key / quota / URL.")
             st.exception(e)
             return
 
-    # ----- METRICS -----
+    # Summary
     st.subheader("Channel Summary")
     metrics = compute_metrics(df)
     c1, c2, c3, c4 = st.columns(4)
@@ -274,6 +274,7 @@ def main():
     st.subheader("📈 Views Over Time")
     plot_views_over_time(df)
 
+    # Topics
     st.subheader("💡 Next Video Topic Predictions")
     topics, keywords = build_topic_predictions(df)
 
@@ -284,18 +285,27 @@ def main():
     else:
         st.info("Not enough keywords to generate topic suggestions.")
 
-    # IMPORTANT: Use st.table (not st.dataframe) to avoid LargeUtf8 Arrow crash
-    st.write("Top weighted keywords:")
-    kw_df = pd.DataFrame(keywords, columns=["Keyword", "Score"]).copy()
-    kw_df["Keyword"] = kw_df["Keyword"].astype(str)
-    kw_df["Score"] = pd.to_numeric(kw_df["Score"], errors="coerce").fillna(0.0)
-    st.table(kw_df)
+    # IMPORTANT: NO st.table/st.dataframe here (fix LargeUtf8)
+    st.subheader("Top weighted keywords")
+    kw_rows = [[safe_text(k), f"{float(s):.3f}"] for k, s in keywords]
+    if kw_rows:
+        render_as_markdown_table(["Keyword", "Score"], kw_rows)
+    else:
+        st.info("No keywords available.")
 
     st.subheader("📄 Latest Videos")
-    safe_df = df[["title", "published_at", "views", "likes", "comments"]].copy()
-    safe_df["title"] = safe_df["title"].astype(str)
-    safe_df["published_at"] = safe_df["published_at"].astype(str)
-    st.table(safe_df)
+    if df.empty:
+        st.info("No videos to show.")
+    else:
+        # Show as markdown list (no Arrow)
+        df_latest = df.sort_values("published_at", ascending=False).head(12).copy()
+        for _, r in df_latest.iterrows():
+            st.markdown(
+                f"**{safe_text(r['title'])}**  \n"
+                f"- Published: {safe_text(r['published_at'])}  \n"
+                f"- Views: {int(r['views'])} | Likes: {int(r['likes'])} | Comments: {int(r['comments'])}"
+            )
+            st.divider()
 
 
 if __name__ == "__main__":
