@@ -305,7 +305,7 @@ def main():
                 f"- Published: {safe_text(r['published_at'])}  \n"
                 f"- Views: {int(r['views'])} | Likes: {int(r['likes'])} | Comments: {int(r['comments'])}"
             )
-            st.divider()
+            st.markdown("---")
 
 
 if __name__ == "__main__":
